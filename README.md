@@ -1,260 +1,176 @@
+# Peer-to-Peer Distributed File Sharing System (DFSS) - Mini BitTorrent
 
-
----
-
-# Peer-to-Peer Distributed File Sharing System (DFSS)
+A robust, multi-threaded **Hybrid Peer-to-Peer (P2P) File Sharing System** written in C++17. The system uses central Trackers for managing peer metadata, user authentication, group management, and file indexing, while piece-by-piece file transfers are executed directly between peers over TCP sockets.
 
 ---
 
-## 1. How to Compile and Run
+## 1. Directory & Code Structure
 
-To compile and run this project, I need the OpenSSL library (for calculating SHA1 hashes) and a standard g++ compiler.
+The project is organized into structured subdirectories categorized by responsibility:
 
-### 1.1. Compilation
-
-I include the necessary libraries (`-pthread` for threads and `-lcrypto` for SHA1).
-
-**Command Format:**
-
-```bash
-g++ -o <executable_name> <source_file>.cpp -std=c++17 -pthread -lcrypto
+```
+MINI_BIT_TORRENT/
+├── README.md                 # System Documentation
+├── tracker_info.txt          # Shared tracker configuration (IP:Port for T1 & T2)
+├── client/                   # Client / Peer Application
+│   ├── Makefile              # Build script for Client executable
+│   ├── tracker_info.txt      # Client-side tracker address file
+│   ├── main.cpp              # Client CLI entry point and main socket event loop
+│   ├── downloader/           # Downloader and piece transfer management
+│   │   ├── thread_pool.h     # Concurrent ThreadPool manager for piece downloads
+│   │   ├── download_manager.h# Status tracker for active/completed downloads
+│   │   ├── download_manager.cpp
+│   │   ├── peer_downloader.h # Parallel piece downloading & verification logic
+│   │   └── peer_downloader.cpp
+│   ├── seeder/               # Peer serving (Seeder) module
+│   │   ├── seeder.h          # Seeder listener thread & peer request handler
+│   │   └── seeder.cpp
+│   └── utils/                # Utility & cryptographic functions
+│       ├── crypto_utils.h    # SHA1 calculation and hex string utilities
+│       ├── crypto_utils.cpp
+│       ├── client_utils.h    # File metadata, tracker info reader, socket check
+│       └── client_utils.cpp
+└── tracker/                  # Tracker Server Application
+    ├── Makefile              # Build script for Tracker executable
+    ├── tracker_info.txt      # Tracker configuration file
+    ├── updates.txt           # Persistent log file for sync recovery during failover
+    ├── main.cpp              # Tracker main server socket listener & entry point
+    ├── state/                # Tracker global state & data structures
+    │   ├── tracker_state.h   # Maps for users, groups, file metadata & mutexes
+    │   └── tracker_state.cpp
+    ├── sync/                 # Inter-tracker synchronization & failover
+    │   ├── tracker_sync.h    # Heartbeat, sync messages, and log recovery
+    │   └── tracker_sync.cpp
+    ├── handler/              # Client command processor
+    │   ├── client_handler.h  # Request parsing & command handling logic
+    │   └── client_handler.cpp
+    └── utils/                # Tracker utilities
+        ├── tracker_utils.h   # Socket checks and tracker config reader
+        └── tracker_utils.cpp
 ```
 
-**Actual Commands:**
+---
 
+## 2. Compilation and Setup
+
+### 2.1. Prerequisites
+- **Compiler**: `g++` (C++17 standard support)
+- **Libraries**: OpenSSL (`-lcrypto`) for SHA1 calculations, Posix Threads (`-pthread`)
+
+### 2.2. Building the Project
+
+**Option 1: Using Makefile (Recommended)**
 ```bash
-# Compile the Tracker (creates the 'tracker' executable)
-g++ -o tracker tracker.cpp -std=c++17 -pthread -lcrypto  or make
+# Build Tracker executable
+cd tracker
+make
 
-# Compile the Client (creates the 'client' executable)
-g++ -o client client.cpp -std=c++17 -pthread -lcrypto or make
+# Build Client executable
+cd ../client
+make
 ```
 
-### 1.2. Setup File: `tracker_info.txt`
+**Option 2: Direct Compilation Command**
+```bash
+# Compile Tracker
+g++ -o tracker tracker/main.cpp tracker/state/*.cpp tracker/sync/*.cpp tracker/handler/*.cpp tracker/utils/*.cpp -std=c++17 -pthread -lcrypto -Itracker
 
-Before running anything, I create a file named **`tracker_info.txt`** that contains the IP and port for both the main tracker (T1) and the backup tracker (T2).
+# Compile Client
+g++ -o client client/main.cpp client/downloader/*.cpp client/seeder/*.cpp client/utils/*.cpp -std=c++17 -pthread -lcrypto -Iclient
+```
 
-**Example `tracker_info.txt`:**
+---
 
+## 3. How to Run
+
+### 3.1. Tracker Setup Configuration (`tracker_info.txt`)
+Create or edit `tracker_info.txt` containing IP and Port addresses for Tracker 1 (Primary) and Tracker 2 (Backup):
 ```
 127.0.0.1:8989
 127.0.0.1:8990
 ```
 
-### 1.3. Execution
+### 3.2. Execution Order
 
-I run the two trackers first, and then I start multiple client peers.
+1. **Start Primary Tracker (T1):**
+   ```bash
+   ./tracker tracker_info.txt 1
+   ```
 
-**Start Tracker 1 (T1 - Main):**
+2. **Start Secondary/Backup Tracker (T2):**
+   ```bash
+   ./tracker tracker_info.txt 2
+   ```
 
-```bash
-# Terminal 1
-./tracker tracker_info.txt 1
-```
+3. **Start Client Instance(s):**
+   ```bash
+   ./client <Client_IP>:<Client_Port> tracker_info.txt
 
-**Start Tracker 2 (T2 - Backup):**
-
-```bash
-# Terminal 2
-./tracker tracker_info.txt 2
-```
-
-**Start Client:**
-
-```bash
-# Terminal 3 (or 4, etc.)
-./client <Client_IP>:<Client_Port> tracker_info.txt
-
-# Example:
-./client 127.0.0.1:5000 tracker_info.txt
-```
+   # Example:
+   ./client 127.0.0.1:5000 tracker_info.txt
+   ```
 
 ---
 
-## 2. Architectural Overview (Hybrid P2P Design)
+## 4. Architectural Overview (Hybrid P2P Design)
 
-My system uses a **Hybrid P2P Architecture**. I use centralized servers (Trackers) only for metadata, while actual file transfers happen directly between peers.
+```
+                       +-----------------------+
+                       |    Primary Tracker    |
+                       |         (T1)          |
+                       +-----------+-----------+
+                                   | Heartbeat / Sync
+                                   v
+                       +-----------------------+
+                       |    Backup Tracker     |
+                       |         (T2)          |
+                       +-----------------------+
+                                ^     ^
+            Metadata Queries /  |     | Metadata Queries /
+            File Registration   |     | File Registration
+                                v     v
+             +--------------------+ +--------------------+
+             | Peer 1 (Uploader)  |<| Peer 2 (Leecher)   |
+             +--------------------+ +--------------------+
+                        Direct Piece Transfer (TCP)
+```
 
-| Component         | Role                                                                      | Concurrency                                                      |
-| ----------------- | ------------------------------------------------------------------------- | ---------------------------------------------------------------- |
-| Tracker (T1 & T2) | Keeps track of users, groups, file hashes, and IP:PORT of active seeders. | Multithreaded – spawns a new thread for every client connection. |
-| Client (Peer)     | Acts as both downloader (Leecher) and uploader (Seeder).                  | Runs a Seeder Thread and a Thread Pool for downloading.          |
-| Communication     | All done using TCP sockets for reliability.                               | TCP chosen for guaranteed delivery and correctness.              |
+| Component | Architecture & Responsibilities | Concurrency Model |
+| :--- | :--- | :--- |
+| **Tracker (T1 & T2)** | Manages user credentials, group memberships, group file indexes, and active seeder IP:Port mappings. Maintains state consistency across primary and backup instances. | **Multithreaded**: Spawns a dedicated thread per client socket connection. |
+| **Client (Peer)** | Functions simultaneously as a **Seeder** (listening server serving 512KB pieces to peers) and a **Leecher** (multi-threaded piece downloader using custom ThreadPool). | **Multithreaded**: Dedicated seeder thread + worker thread pool for parallel piece downloading. |
+| **Communication** | Direct peer-to-peer piece downloads over TCP sockets with SHA1 checksum verification. | Async task execution with `pwrite` thread-safe file writing. |
 
-### 2.1. Tracker Synchronization (High Availability)
-
-* **Primary/Backup Model**: T1 is primary, T2 is backup.
-* **Heartbeat**: T2 constantly pings T1.
-* **Failover**: If T1 goes down, T2 takes over and logs updates.
-* **Recovery**: When T1 returns, T2 replays updates to sync.
+### 4.1. Tracker Failover & High Availability
+- **Heartbeat Monitoring**: T2 periodically checks T1's liveness.
+- **Failover**: If T1 fails, clients automatically reconnect to T2. T2 logs all state updates into `updates.txt`.
+- **Sync Back**: When T1 comes back online, T2 replays logged state changes from `updates.txt` to sync T1 up to date.
 
 ---
 
-## 3. Key Algorithms and Data Structures
+## 5. Key Features & Supported Commands
 
-### 3.1. Download Optimization: Thread Pool
-
-* Initially, spawning a thread per piece slowed performance.
-* I implemented a **Thread Pool** (≈2×CPU cores).
-* Benefit: Reduced 1GB download time by ~95%.
-
-### 3.2. Piece Strategy and Integrity
-
-* **Strategy**: Sequential piece download.
-* **Check**: SHA1 hash per 512 KB piece.
-* **Retries**: Up to 3 attempts with seeder switching.
-
-### 3.3. Data Structures Used
-
-```cpp
-// username -> password
-unordered_map<string, string> registered_users;
-
-// groupname -> list of usernames
-unordered_map<string, vector<string>> group_to_members;
-
-// groupname -> owner username
-unordered_map<string, string> group_to_owner;
-
-// groupname -> pending join requests
-unordered_map<string, vector<string>> group_to_requests;
-
-// file path -> file metadata (SHA, size, piece hashes)
-unordered_map<string, string> file_to_hashes;
-
-// group id -> list of files shared
-unordered_map<string, vector<string>> group_files;
-
-// file path -> list of users with complete file
-unordered_map<string, vector<string>> file_owners;
-
-// file path -> (size, piece hashes)
-unordered_map<string, pair<long long, string>> file_metadata;
-
-// user -> ip:port of active client
-unordered_map<string, string> logged_in_clients;
-
-// lock to prevent race conditions
-mutex global_data_lock;
-```
+| Command Category | Command Syntax | Description |
+| :--- | :--- | :--- |
+| **User Management** | `create_user <user_id> <password>` | Register a new user account |
+| | `login <user_id> <password>` | Authenticate and register active seeder endpoint |
+| | `logout` | Logout user and unregister active seedings |
+| **Group Management**| `create_group <group_id>` | Create a new peer group (creator becomes owner) |
+| | `join_group <group_id>` | Send request to join an existing group |
+| | `list_requests <group_id>` | (Owner) View pending join requests |
+| | `accept_request <group_id> <user_id>` | (Owner) Accept a user's join request |
+| | `leave_group <group_id>` | Leave group (triggers owner re-assignment or group deletion) |
+| | `list_groups` | View all available groups on the network |
+| **File Sharing** | `upload_file <group_id> <file_path>` | Compute piece hashes and register file with tracker |
+| | `list_files <group_id>` | List all files shared within a group |
+| | `download_file <group_id> <file_name> <dest_path>` | Query seeders & download file pieces in parallel |
+| | `show_downloads` | View status of active `[P]` and completed `[C]` downloads |
+| | `stop_share <group_id> <file_name>` | Stop seeding a specific file |
 
 ---
 
-## 4. Network Protocol Design and Message Formats
+## 6. Optimization Algorithms & Implementation Details
 
-### 4.1. Tracker Protocol (Client → Tracker)
-
-Commands are space-separated strings.
-
-* **Login**:
-
-  ```
-  login <user> <pass> <ip:port>
-  ```
-* **Upload**:
-
-  ```
-  upload_file <path> <group> <size> <hashes>
-  ```
-* **Download Response**:
-
-  ```
-  metadata_and_seeders <size> <hashes> <ip1:port1> <ip2:port2> ...
-  ```
-
-### 4.2. Peer-to-Peer Protocol (Client → Seeder)
-
-* **Request**:
-
-  ```
-  REQUEST_PIECE <file_name> <piece_index>
-  ```
-* **Response**:
-  Binary 512KB chunk.
-
----
-
-## 5. Features, Limitations, and Assumptions
-
-| Status | Feature               | Notes                                                                |
-| ------ | --------------------- | -------------------------------------------------------------------- |
-| Done | User/Group Management | create_user, login, create_group, join_group, accept_request, logout |
-|  Done | File Operations       | upload_file, list_files, download_file, stop_share, show_downloads   |
-|  Done | High Availability     | Tracker failover with sync back                                      |
-
-**Assumptions**:
-
-* `tracker_info.txt` contains valid addresses.
-* Client IP:Port is reachable.
-* File paths are relative to client’s directory.
-
----
-
-## 6. Testing Procedures
-
-### 6.1. Basic Functionality Test
-
-```bash
-# Terminal 1 - Tracker 1
-./tracker tracker_info.txt 1
-
-# Terminal 2 - Tracker 2
-./tracker tracker_info.txt 2
-
-# Terminal 3 - Client 1 (Seeder)
-./client 127.0.0.1:5000 tracker_info.txt
-create_user seeder pass
-login seeder pass
-create_group TestGroup
-upload_file TestGroup fivehundred.bin
-list_files TestGroup
-
-# Terminal 4 - Client 2 (Leecher)
-./client 127.0.0.1:5001 tracker_info.txt
-create_user leech pass
-login leech pass
-list_groups
-join_group TestGroup
-
-# Back to Client 1
-list_requests TestGroup
-accept_request TestGroup leech
-
-# Back to Client 2
-list_files TestGroup
-download_file TestGroup fivehundred.bin ./downloaded_file.bin
-show_downloads
-```
-
-### 6.2. Large File (1GB)
-
-```bash
-dd if=/dev/urandom of=onegb.bin bs=1M count=1024
-upload_file TestGroup onegb.bin
-download_file TestGroup onegb.bin ./onegb_downloaded.bin
-show_downloads
-```
-
-### 6.3. Tracker Failover
-
-* Kill T1 during download (`Ctrl+C`).
-* Client auto-switches to T2.
-* Restart T1 → T2 syncs back updates.
-
-### 6.4. `stop_share`
-
-```bash
-stop_share TestGroup fivehundred.bin
-```
-
-* File remains listed but with no seeders.
-
-### 6.5. `logout`
-
-```bash
-logout
-```
-
-* Seeder stops sharing all files.
-
-
+1. **ThreadPool Downloader**: Avoids thread-creation overhead by reusing worker threads. Uses $2 \times \text{CPU cores}$ for parallel network piece fetching.
+2. **512 KB Piece Partitioning**: Files are segmented into 512 KB pieces. Each piece hash is verified against SHA1 hashes retrieved from the tracker before saving to disk via `pwrite`.
+3. **Seeder Promotion**: Upon successful completion of a file download, the client automatically notifies the tracker via `promote_seeder` to register itself as an active seeder for other leechers.

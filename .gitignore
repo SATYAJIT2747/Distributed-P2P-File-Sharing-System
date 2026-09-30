@@ -1,0 +1,4 @@
+*.o
+client/client
+tracker/tracker
+*.bin
