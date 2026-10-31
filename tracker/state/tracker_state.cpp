@@ -3,6 +3,7 @@
 using namespace std;
 
 volatile bool is_main_tracker_up = true;
+atomic<bool> is_peer_tracker_up(true);
 string my_ip_port;
 string main_tracker_ip_port;
 string peer_ip_port;

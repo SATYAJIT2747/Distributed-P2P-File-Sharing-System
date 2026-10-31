@@ -54,22 +54,21 @@ int main(int argc, char *argv[])
     cout << "my address: " << my_ip_port << endl;
     cout << "peer address: " << peer_ip_port << endl;
 
-    if (tracker_number == 2)
-    {
-        thread hb_thread(heartbeat_thread);
-        hb_thread.detach();
-    }
+    // both trackers watch each other, so either one can log updates while the other is down
+    thread hb_thread(heartbeat_thread);
+    hb_thread.detach();
 
-    if (tracker_number == 2 && !is_main_tracker_up)
-    {
-        cout << "T1 is down at startup. Recovering pending updates..." << endl;
-        recover_from_log();
-    }
+    thread sync_thread(sync_worker_thread);
+    sync_thread.detach();
 
     int tracker_socket;
     struct sockaddr_in tracker_address, client_address;
 
     ensure_success((tracker_socket = socket(AF_INET, SOCK_STREAM, 0)), "socket creation is failed!");
+
+    // lets a crashed tracker restart on the same port right away instead of waiting for TIME_WAIT
+    int reuse = 1;
+    setsockopt(tracker_socket, SOL_SOCKET, SO_REUSEADDR, &reuse, sizeof(reuse));
 
     bzero(&tracker_address, sizeof(tracker_address));
     tracker_address.sin_family = AF_INET;

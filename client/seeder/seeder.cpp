@@ -10,12 +10,45 @@
 #include <thread>
 #include <sstream>
 #include <vector>
+#include <unordered_map>
+#include <mutex>
 #include <cerrno>
 #include <cstdio>
 
 using namespace std;
 
 volatile int global_seeder_port = 0;
+
+static unordered_map<string, string> shared_files;
+static mutex shared_files_mutex;
+
+void add_shared_file(const string &file_name, const string &local_path)
+{
+    lock_guard<mutex> lock(shared_files_mutex);
+    shared_files[file_name] = local_path;
+}
+
+void remove_shared_file(const string &file_name)
+{
+    lock_guard<mutex> lock(shared_files_mutex);
+    shared_files.erase(file_name);
+}
+
+void clear_shared_files()
+{
+    lock_guard<mutex> lock(shared_files_mutex);
+    shared_files.clear();
+}
+
+static bool find_shared_file(const string &file_name, string &local_path)
+{
+    lock_guard<mutex> lock(shared_files_mutex);
+    auto it = shared_files.find(file_name);
+    if (it == shared_files.end())
+        return false;
+    local_path = it->second;
+    return true;
+}
 
 void handle_peer_request(int peer_socket)
 {
@@ -44,7 +77,15 @@ void handle_peer_request(int peer_socket)
     string file_name = parts[1];
     int piece_index = stoi(parts[2]);
     const int PIECE_SIZE = 512 * 1024;
-    string local_path = "./" + file_name;
+
+    // never open a path straight from the request, or a peer could ask for any file on this disk
+    string local_path;
+    if (!find_shared_file(file_name, local_path))
+    {
+        cerr << "refusing request for " << file_name << ": not a shared file\n";
+        close(peer_socket);
+        return;
+    }
 
     int fd = open(local_path.c_str(), O_RDONLY);
     if (fd < 0)

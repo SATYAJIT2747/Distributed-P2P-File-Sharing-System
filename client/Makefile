@@ -5,6 +5,7 @@ LIBS = -pthread -lcrypto
 SRCS = main.cpp \
        downloader/download_manager.cpp \
        downloader/peer_downloader.cpp \
+       network/tracker_connection.cpp \
        seeder/seeder.cpp \
        utils/crypto_utils.cpp \
        utils/client_utils.cpp

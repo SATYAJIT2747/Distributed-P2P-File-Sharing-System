@@ -68,14 +68,19 @@ void client_handler(int client_socket)
             }
             else if (command_parts[1] == "create_group")
             {
+                // a retried sync can arrive twice, so only add if not already there
                 lock_guard<mutex> lock(global_data_lock);
-                group_to_members[command_parts[2]].push_back(command_parts[3]);
+                auto &members = group_to_members[command_parts[2]];
+                if (find(members.begin(), members.end(), command_parts[3]) == members.end())
+                    members.push_back(command_parts[3]);
                 group_to_owner[command_parts[2]] = command_parts[3];
             }
             else if (command_parts[1] == "join_group")
             {
                 lock_guard<mutex> lock(global_data_lock);
-                group_to_requests[command_parts[2]].push_back(command_parts[3]);
+                auto &requests = group_to_requests[command_parts[2]];
+                if (find(requests.begin(), requests.end(), command_parts[3]) == requests.end())
+                    requests.push_back(command_parts[3]);
             }
             else if (command_parts[1] == "accept_request")
             {
@@ -752,7 +757,12 @@ void client_handler(int client_socket)
             response_message = "err: unknown command.";
         }
 
-        if (command_parts[0] != "SYNC")
+        if (command_parts[0] == "SYNC")
+        {
+            // tells the sending tracker this update was applied, so it doesn't retry or log it
+            send(client_socket, "SYNC_ACK", 9, MSG_NOSIGNAL);
+        }
+        else
         {
             send(client_socket, &response_message[0], response_message.length() + 1, MSG_NOSIGNAL);
         }

@@ -5,8 +5,10 @@
 #include <vector>
 #include <unordered_map>
 #include <mutex>
+#include <atomic>
 
 extern volatile bool is_main_tracker_up;
+extern std::atomic<bool> is_peer_tracker_up;
 extern std::string my_ip_port;
 extern std::string main_tracker_ip_port;
 extern std::string peer_ip_port;

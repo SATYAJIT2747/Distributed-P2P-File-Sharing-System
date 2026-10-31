@@ -1,6 +1,8 @@
 #include "downloader/peer_downloader.h"
 #include "downloader/download_manager.h"
 #include "downloader/thread_pool.h"
+#include "network/tracker_connection.h"
+#include "seeder/seeder.h"
 #include "utils/crypto_utils.h"
 #include "utils/client_utils.h"
 #include <iostream>
@@ -199,30 +201,28 @@ void download_file_pieces(
     {
         cout << "download complete! All " << total_pieces << " pieces downloaded.\n";
 
-        lock_guard<mutex> lock(download_status_mutex);
-        if (download_status_map.count(key))
-            download_status_map[key].status = COMPLETED;
-
-        // Promote to seeder
-        string promotion_msg = "promote_seeder " + file_name + " " + group_id;
-        int temp_sock = socket(AF_INET, SOCK_STREAM, 0);
-        if (temp_sock >= 0)
         {
-            struct sockaddr_in server_address;
-            string tracker_ip = "127.0.0.1";
-            int tracker_port = 8989;
+            lock_guard<mutex> lock(download_status_mutex);
+            if (download_status_map.count(key))
+                download_status_map[key].status = COMPLETED;
+        }
 
-            bzero(&server_address, sizeof(server_address));
-            server_address.sin_family = AF_INET;
-            server_address.sin_port = htons(tracker_port);
-            inet_pton(AF_INET, tracker_ip.c_str(), &server_address.sin_addr);
+        // Promote to seeder. Serve the file from where it was saved, and register it
+        // on the logged-in session (a new connection would not be logged in).
+        add_shared_file(file_name, dest_path);
 
-            if (connect(temp_sock, (struct sockaddr *)&server_address, sizeof(server_address)) >= 0)
-            {
-                send(temp_sock, promotion_msg.c_str(), promotion_msg.length() + 1, 0);
-                close(temp_sock);
-                cout << "told tracker: now seeding " << file_name << ".\n";
-            }
+        string promotion_msg = "promote_seeder " + file_name + " " + group_id;
+        string reply;
+        if (tracker_request(promotion_msg, reply) &&
+            (reply.find("successfully promoted") != string::npos ||
+             reply.find("already listed as a seeder") != string::npos))
+        {
+            cout << "now seeding " << file_name << ".\n";
+        }
+        else
+        {
+            remove_shared_file(file_name);
+            cerr << "could not register as seeder for " << file_name << ": " << reply << endl;
         }
     }
     else

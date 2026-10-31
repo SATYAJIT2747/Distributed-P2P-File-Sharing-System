@@ -4,7 +4,8 @@ A robust, multi-threaded **Hybrid Peer-to-Peer (P2P) File Sharing System** writt
 
 **Highlights**
 
-- Two synchronised Trackers with automatic failover and log-based state recovery.
+- Two synchronised Trackers with acknowledged sync, log-based recovery in both directions, and **mid-session client failover with automatic re-login**.
+- Downloaders become real seeders, and a seeder only serves files that were deliberately shared (no path traversal). See [Section 10.1](#101-v2-reliability--security-hardening).
 - Every client is both a **Seeder** and a **Leecher**.
 - Parallel piece downloads through a fixed-size **ThreadPool** (2 x CPU cores).
 - **SHA1 verification** of every 512 KB piece, with automatic retry from a different seeder.
@@ -48,8 +49,11 @@ MINI_BIT_TORRENT/
 │   │   ├── download_manager.cpp
 │   │   ├── peer_downloader.h # Parallel piece downloading & verification logic
 │   │   └── peer_downloader.cpp
+│   ├── network/              # Tracker session shared by all client threads
+│   │   ├── tracker_connection.h # Request/reply, failover to the other tracker, auto re-login
+│   │   └── tracker_connection.cpp
 │   ├── seeder/               # Peer serving (Seeder) module
-│   │   ├── seeder.h          # Seeder listener thread & peer request handler
+│   │   ├── seeder.h          # Seeder listener, peer request handler & shared-files list
 │   │   └── seeder.cpp
 │   └── utils/                # Utility & cryptographic functions
 │       ├── crypto_utils.h    # SHA1 calculation and hex string utilities
@@ -59,13 +63,13 @@ MINI_BIT_TORRENT/
 └── tracker/                  # Tracker Server Application
     ├── Makefile              # Build script for Tracker executable
     ├── tracker_info.txt      # Tracker configuration file
-    ├── updates.txt           # Persistent log file for sync recovery during failover
+    ├── updates_t1.txt / updates_t2.txt # Created at runtime: updates waiting for the other tracker
     ├── main.cpp              # Tracker main server socket listener & entry point
     ├── state/                # Tracker global state & data structures
     │   ├── tracker_state.h   # Maps for users, groups, file metadata & mutexes
     │   └── tracker_state.cpp
     ├── sync/                 # Inter-tracker synchronization & failover
-    │   ├── tracker_sync.h    # Heartbeat, sync messages, and log recovery
+    │   ├── tracker_sync.h    # Heartbeat, acknowledged sync queue, and log recovery
     │   └── tracker_sync.cpp
     ├── handler/              # Client command processor
     │   ├── client_handler.h  # Request parsing & command handling logic
@@ -82,11 +86,12 @@ MINI_BIT_TORRENT/
 | `client/downloader/thread_pool.h` | Fixed-size worker pool with a task queue for piece downloads |
 | `client/downloader/peer_downloader` | Parallel piece download, seeder selection, retries, SHA1 verification |
 | `client/downloader/download_manager` | Tracks active `[P]` and completed `[C]` downloads |
-| `client/seeder/` | Listener thread that serves pieces to other peers |
+| `client/network/tracker_connection` | One thread-safe tracker session for the CLI and download threads; switches tracker mid-session and logs in again |
+| `client/seeder/` | Listener thread that serves pieces to other peers, only for files in its shared-files list |
 | `client/utils/crypto_utils` | SHA1 calculation and hex-string helpers |
 | `tracker/state/` | Shared maps (users, groups, file metadata, owners) and the mutex protecting them |
-| `tracker/sync/` | Heartbeat, tracker-to-tracker sync messages, `updates.txt` recovery |
-| `tracker/handler/` | Parses and executes client commands |
+| `tracker/sync/` | Bidirectional heartbeat, background sync worker (ACK + retry), `updates_t<N>.txt` log and ordered replay |
+| `tracker/handler/` | Parses and executes client commands; applies `SYNC` updates and replies `SYNC_ACK` |
 
 ---
 
@@ -116,7 +121,7 @@ make
 g++ -o tracker tracker/main.cpp tracker/state/*.cpp tracker/sync/*.cpp tracker/handler/*.cpp tracker/utils/*.cpp -std=c++17 -pthread -lcrypto -Itracker
 
 # Compile Client
-g++ -o client client/main.cpp client/downloader/*.cpp client/seeder/*.cpp client/utils/*.cpp -std=c++17 -pthread -lcrypto -Iclient
+g++ -o client client/main.cpp client/downloader/*.cpp client/network/*.cpp client/seeder/*.cpp client/utils/*.cpp -std=c++17 -pthread -lcrypto -Iclient
 ```
 
 ---
@@ -193,9 +198,11 @@ There are three kinds of communication, all over TCP:
 File sharing needs reliable delivery. With UDP the application would have to implement lost-packet detection, retransmission and ordering itself; TCP provides all of this automatically.
 
 ### 4.2. Tracker Failover & High Availability
-- **Heartbeat Monitoring**: T2 periodically checks T1's liveness.
-- **Failover**: If T1 fails, clients automatically reconnect to T2. T2 logs all state updates into `updates.txt`.
-- **Sync Back**: When T1 comes back online, T2 replays logged state changes from `updates.txt` to sync T1 up to date.
+- **Heartbeat Monitoring**: Each tracker checks the other's liveness every 5 seconds.
+- **Reliable Sync**: Every state change is queued and sent to the other tracker by a background sync thread, which waits for a `SYNC_ACK` and retries up to 3 times. Client requests never wait on this network work.
+- **Failover**: If the client's tracker stops responding mid-session, the client switches to the other tracker, logs in again automatically, and resends the command.
+- **Sync Back**: While the other tracker is down, updates are appended to `updates_t<N>.txt` (on T1 *or* T2). When it comes back, they are replayed oldest first, before any newer update.
+- **Fast Restart**: Trackers set `SO_REUSEADDR`, so a crashed tracker can restart on the same port immediately.
 
 ### 4.3. Tracker State
 The tracker keeps its state in in-memory hash maps, guarded by a global mutex:
@@ -239,7 +246,7 @@ A typical session with two clients (commands are typed at each client's prompt):
 create_user alice pass123
 login alice pass123
 create_group team1
-upload_file team1 /path/to/bigfile.iso
+upload_file team1 bigfile.iso      # run from the file's folder: the name is registered exactly as typed
 
 # Client B (127.0.0.1:5001)
 create_user bob pass456
@@ -252,11 +259,11 @@ accept_request team1 bob
 
 # Client B
 list_files team1
-download_file team1 bigfile.iso /path/to/save/
+download_file team1 bigfile.iso /path/to/save/bigfile.iso   # destination is a file path
 show_downloads          # [P] while running, [C] when complete
 ```
 
-When Client B's download completes, it notifies the tracker (`promote_seeder`) and becomes a seeder for that file too.
+When Client B's download completes, it notifies the tracker (`promote_seeder`) over its logged-in session and becomes a seeder for that file too, serving it from the destination path it was saved to.
 
 ---
 
@@ -264,7 +271,8 @@ When Client B's download completes, it notifies the tracker (`promote_seeder`) a
 
 1. **ThreadPool Downloader**: Avoids thread-creation overhead by reusing worker threads. Uses $2 \times \text{CPU cores}$ for parallel network piece fetching. Downloading is mostly waiting on the network, so while one worker blocks in `recv()`, another can use the CPU.
 2. **512 KB Piece Partitioning**: Files are segmented into 512 KB pieces. Each piece hash is verified against SHA1 hashes retrieved from the tracker before saving to disk via `pwrite`.
-3. **Seeder Promotion**: Upon successful completion of a file download, the client automatically notifies the tracker via `promote_seeder` to register itself as an active seeder for other leechers.
+3. **Seeder Promotion**: Upon successful completion of a file download, the client adds the file to its shared-files list and sends `promote_seeder` on its logged-in tracker session to register itself as an active seeder for other leechers. The tracker's reply is checked; on failure the file is removed from the shared list again.
+4. **Shared-Files Allow-List**: The seeder maps each shared file name to its local path and only serves files that were uploaded or fully downloaded. A `REQUEST_PIECE` for anything else (for example `../../etc/passwd`) is refused.
 
 ### 7.1. Piece Selection (Sequential)
 Pieces are enqueued in order from `0` to `N-1`. All tasks enter the queue immediately and the pool workers pick them up and download in parallel. There is no rarest-first strategy.
@@ -364,7 +372,9 @@ The 32-thread configuration was also charted (roughly 3.3 s and 314 MB/s at 1024
 | :--- | :--- |
 | Backup tracker detects main tracker is down | 5 seconds |
 | Backup takes over | less than 3-4 seconds |
-| State recovery | Saved updates are replayed from `updates.txt` |
+| Connected clients | Switch to the other tracker on their next command, log in again automatically, and resend the command |
+| Either tracker down | The other one logs updates to `updates_t<N>.txt` after 3 unacknowledged attempts |
+| State recovery | Logged updates are replayed oldest first, each confirmed with `SYNC_ACK`, before newer updates |
 
 ### 9.2. Download Failures
 - If a piece download fails, the system retries with a different seeder (up to 3 retries).
@@ -411,6 +421,25 @@ while (total_received < msg_buff_size - 1) {
 }
 ```
 
+### 10.1. v2: Reliability & Security Hardening
+
+A review of the failover and seeding paths found five defects that the benchmarks did not exercise. All are fixed and were verified with a scripted end-to-end kill test (2 trackers, 3 clients) on Ubuntu.
+
+| Problem | Root cause | Fix | Verified by |
+| :--- | :--- | :--- | :--- |
+| Seeder promotion never registered | `promote_seeder` was sent on a new socket to a hard-coded `127.0.0.1:8989`; that connection had no logged-in user, so the tracker replied "please login first", and the reply was never read | Sent through `tracker_request()` on the logged-in session (whichever tracker is active); the reply is checked | Leecher printed `now seeding f.bin`; the update reached the other tracker |
+| Completed downloads could not be served | The file was saved to `dest_path`, but the seeder only opened `./<file_name>` | Completed files are registered in the shared-files map at their real path | Original seeder killed; a third client downloaded the whole file from the leecher alone (byte-identical) |
+| Path traversal in the seeder | The seeder opened `./` + the name from `REQUEST_PIECE` without checking it was shared | Shared-files allow-list; any other name is refused | `REQUEST_PIECE /etc/passwd 0` refused, 0 bytes returned |
+| Client failover only at startup | The client tried T2 only when it first connected; a later tracker crash ended the client | New `client/network` module: on a failed send/recv it connects to the other tracker, repeats the last login, and resends the command | T1 killed mid-session; both clients switched to T2, logged in again, and their next commands succeeded |
+| Tracker sync could lose updates | Only T2 logged missed updates (T1 dropped them when T2 was down); sync was fire-and-forget with no ACK or retry | Background sync worker with `SYNC_ACK`, 3 retries, logs on both trackers, oldest-first replay | 3 updates replayed T2 to T1 and 1 update replayed T1 to T2 after restarts; logs emptied |
+
+Related changes made while fixing these:
+
+- `synchronize_with_peer()` only queues the update, so request handlers no longer do network I/O while holding `global_data_lock`.
+- `SYNC create_group` / `SYNC join_group` skip entries that already exist, so a retried update cannot create duplicates.
+- Trackers set `SO_REUSEADDR`, so a restarted tracker no longer fails with `Address already in use`.
+- Client replies are read until the `\0` terminator, and the client exits cleanly when standard input closes.
+
 ---
 
 ## 11. Limitations and Notes
@@ -419,8 +448,11 @@ while (total_received < msg_buff_size - 1) {
 - **Single global mutex** on the tracker: simple and safe, but it serialises all tracker state access.
 - **Test environment undocumented**: hardware, network and seeder count are not recorded with the benchmarks.
 - **Small/medium file performance** does not improve (and can worsen) with 16+ threads.
-- **Tracker state is in memory**; `updates.txt` is used for failover recovery between the two trackers.
-- Passwords are stored and compared as plain strings in the tracker's user map.
+- **Tracker state is in memory.** A restarted tracker receives the updates logged while it was down, but not the state it held before it crashed; a full state snapshot on reconnect would close this gap.
+- **The sync queue is in memory**: updates not yet delivered or logged are lost if that tracker process itself crashes.
+- **Resent commands after failover** may be rejected as duplicates if the old tracker applied them but crashed before replying (for example `user already exists`).
+- **Seeder address** sent at login is always `127.0.0.1:<port>`, so peers must run on the same machine.
+- Passwords are stored and compared as plain strings in the tracker's user map, and traffic is not encrypted.
 
 ---
 
@@ -433,6 +465,9 @@ while (total_received < msg_buff_size - 1) {
 | Build error about SHA1 / OpenSSL | Install the OpenSSL development package and keep `-lcrypto` in the link command |
 | Download stalls or a piece keeps failing | The seeder may be offline or have run `stop_share`; check `list_files` and `show_downloads` |
 | Commands rejected after login issues | Run `login` again; `logout` unregisters your active seedings |
+| `could not log in again on the new tracker` after a failover | The other tracker had not received your account yet; run `login` manually |
+| Seeder prints `refusing request ... not a shared file` | The file was never uploaded / fully downloaded by that client, or it ran `stop_share` / `logout` |
+| `download_file` fails with "file metadata not found" | Use the file name exactly as it was given to `upload_file` (see `list_files`) |
 
 ---
 
